@@ -1,0 +1,364 @@
+import os
+import json
+import base64
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from sarvamai import SarvamAI
+
+# Load .env
+env_path = Path(__file__).parent / ".env"
+if env_path.exists():
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip("'\"")
+            if key and val:
+                os.environ[key] = val
+
+api_key = os.environ.get("SARVAM_API_KEY")
+if not api_key:
+    raise RuntimeError("SARVAM_API_KEY environment variable is missing in .env")
+
+client = SarvamAI(api_subscription_key=api_key)
+
+app = FastAPI(title="AI Avatar Tutor", description="Multilingual AI Avatar Tutor powered by Sarvam AI")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Speaker mapping per persona and language
+PERSONA_SPEAKERS = {
+    "aparna": {
+        "name": "Prof. Aparna",
+        "role": "Lead EdTech Mentor",
+        "description": "Clear, structured, and deep conceptual explanations.",
+        "avatar_style": "professor",
+        "default_voice": "ritu",
+        "lang_voices": {
+            "en-IN": "ritu",
+            "hi-IN": "ritu",
+            "ta-IN": "kavitha",
+            "te-IN": "kavitha",
+            "kn-IN": "roopa",
+            "bn-IN": "rupali",
+            "mr-IN": "rupali",
+            "gu-IN": "pooja",
+        }
+    },
+    "kabir": {
+        "name": "Dr. Kabir",
+        "role": "Concept & Intuition Guide",
+        "description": "Story-driven, intuitive analogies and calm guidance.",
+        "avatar_style": "mentor",
+        "default_voice": "kabir",
+        "lang_voices": {
+            "en-IN": "kabir",
+            "hi-IN": "kabir",
+            "ta-IN": "vijay",
+            "te-IN": "tarun",
+            "kn-IN": "chetan",
+            "bn-IN": "arnab",
+            "mr-IN": "soham",
+            "gu-IN": "bhavik",
+        }
+    },
+    "simran": {
+        "name": "Simran",
+        "role": "Interactive STEM Coach",
+        "description": "Energetic, engaging, and hands-on problem solving.",
+        "avatar_style": "coach",
+        "default_voice": "simran",
+        "lang_voices": {
+            "en-IN": "simran",
+            "hi-IN": "simran",
+            "ta-IN": "kavitha",
+            "te-IN": "pooja",
+            "kn-IN": "suchitra",
+            "bn-IN": "roopa",
+            "mr-IN": "ishita",
+            "gu-IN": "pooja",
+        }
+    }
+}
+
+LANGUAGE_CONFIG = {
+    "en-IN": "English (India)",
+    "hi-IN": "Hindi (हिन्दी)",
+    "ta-IN": "Tamil (தமிழ்)",
+    "te-IN": "Telugu (తెలుగు)",
+    "kn-IN": "Kannada (ಕನ್ನಡ)",
+    "bn-IN": "Bengali (বাংলা)",
+    "mr-IN": "Marathi (मराठी)",
+    "gu-IN": "Gujarati (ગુજરાતી)",
+}
+
+class ChatRequest(BaseModel):
+    message: str
+    topic: str
+    language: str = "en-IN"
+    persona: str = "simran"
+    mastery_score: int = 15
+    conversation_history: List[Dict[str, str]] = []
+
+class AnswerRequest(BaseModel):
+    topic: str
+    question: str
+    student_answer: str
+    language: str = "en-IN"
+    persona: str = "simran"
+    current_mastery: int = 20
+
+@app.get("/api/config")
+def get_config():
+    return {
+        "personas": PERSONA_SPEAKERS,
+        "languages": LANGUAGE_CONFIG,
+        "curated_topics": [
+            {
+                "id": "binary-search",
+                "title": "Binary Search & Divide and Conquer",
+                "category": "Computer Science",
+                "icon": "⚡",
+                "starter": "Teach me how Binary Search works step by step with a diagram and an interactive array demonstration."
+            },
+            {
+                "id": "neural-networks",
+                "title": "Neural Networks: How Weights & Activations Learn",
+                "category": "Artificial Intelligence",
+                "icon": "🧠",
+                "starter": "Explain how a simple artificial neuron computes an output from inputs and weights."
+            },
+            {
+                "id": "photosynthesis",
+                "title": "Photosynthesis: Light & Dark Reactions",
+                "category": "Biology",
+                "icon": "🌱",
+                "starter": "Teach me the chemical and visual mechanism of photosynthesis on the whiteboard."
+            },
+            {
+                "id": "derivatives-calculus",
+                "title": "Calculus: Geometric Intuition of Derivatives",
+                "category": "Mathematics",
+                "icon": "📐",
+                "starter": "Explain the geometric intuition of derivatives with LaTeX equations and a tangent graph."
+            },
+            {
+                "id": "quantum-superposition",
+                "title": "Quantum Computing: Qubits & Superposition",
+                "category": "Physics",
+                "icon": "⚛️",
+                "starter": "Give me an intuitive lesson on quantum superposition compared to classical bits."
+            }
+        ]
+    }
+
+def synthesize_audio(text: str, language_code: str, persona: str) -> Optional[str]:
+    """Generate TTS audio via Sarvam Bulbul and return data URL."""
+    try:
+        persona_info = PERSONA_SPEAKERS.get(persona, PERSONA_SPEAKERS["simran"])
+        speaker = persona_info["lang_voices"].get(language_code, persona_info["default_voice"])
+        
+        # Keep spoken text reasonably concise for fluid real-time tutoring
+        clean_text = text.replace("**", "").replace("*", "").replace("`", "")[:500]
+        
+        tts_res = client.text_to_speech.convert(
+            text=clean_text,
+            language_code=language_code,
+            speaker=speaker,
+            model="bulbul:v3",
+            output_audio_codec="mp3"
+        )
+        if tts_res.audios and len(tts_res.audios) > 0:
+            return f"data:audio/mp3;base64,{tts_res.audios[0]}"
+    except Exception as e:
+        print(f"[TTS Error] {e}")
+    return None
+
+@app.post("/api/tutor/chat")
+def tutor_chat(req: ChatRequest):
+    lang_name = LANGUAGE_CONFIG.get(req.language, "English")
+    persona_data = PERSONA_SPEAKERS.get(req.persona, PERSONA_SPEAKERS["simran"])
+    
+    system_prompt = f"""You are {persona_data['name']}, an exceptional lifelike AI Avatar Tutor.
+Role: {persona_data['role']}. Style: {persona_data['description']}.
+Target Language: {lang_name} (language code: {req.language}).
+Current Topic: {req.topic}.
+Current Student Mastery Level: {req.mastery_score}%.
+
+YOUR MISSION:
+1. Explain concepts warmly, clearly, and concisely (2-4 punchy spoken sentences in {lang_name}).
+2. Dynamically orchestrate the digital whiteboard using ONE of these whiteboard_types:
+   - "diagram": Provide clean Mermaid.js diagram syntax (graph TD, sequenceDiagram, etc.) inside whiteboard_content.
+   - "latex": Provide crisp LaTeX mathematical formulas with step-by-step derivations.
+   - "document": Provide structured markdown summary cards with key takeaways and bullet points.
+   - "simulation": Provide an interactive simulator spec. Recognized simulation modes: "binary_search", "neural_net", "pendulum_physics".
+3. Choreograph your avatar's lifelike visual state:
+   - avatar_emotion: "explaining" | "encouraging" | "thinking" | "celebrating" | "listening"
+   - avatar_gesture: "point_board" | "welcome" | "hands_open" | "nod" | "ponder"
+4. Create an adaptive checkpoint question to verify the student's understanding before moving to the next concept.
+
+OUTPUT FORMAT:
+You MUST respond with pure JSON only (no markdown code blocks, no backticks, no text outside JSON) matching this exact schema:
+{{
+  "spoken_text": "Spoken explanation in {lang_name} to be voiced by the avatar",
+  "whiteboard_type": "diagram" | "latex" | "document" | "simulation",
+  "whiteboard_title": "Clear title for the whiteboard display",
+  "whiteboard_content": "The Mermaid code, LaTeX equations, markdown notes, or simulation type",
+  "avatar_emotion": "explaining" | "encouraging" | "thinking" | "celebrating",
+  "avatar_gesture": "point_board" | "welcome" | "hands_open" | "nod" | "ponder",
+  "adaptive_question": "A concise question testing the concept just explained",
+  "question_options": ["Option A", "Option B", "Option C", "Option D"],
+  "correct_option_index": 0,
+  "mastery_increment": 15
+}}
+"""
+
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    # Append recent conversation history
+    for item in req.conversation_history[-4:]:
+        messages.append({"role": item.get("role", "user"), "content": item.get("content", "")})
+    
+    messages.append({"role": "user", "content": req.message})
+
+    try:
+        llm_response = client.chat.completions(
+            model="sarvam-105b-conversations",
+            messages=messages,
+            temperature=0.4
+        )
+        raw_text = llm_response.choices[0].message.content.strip()
+        
+        # Extract JSON cleanly even if wrapped in markdown blocks
+        if "```json" in raw_text:
+            raw_text = raw_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in raw_text:
+            raw_text = raw_text.split("```")[1].split("```")[0].strip()
+
+        data = json.loads(raw_text)
+    except Exception as e:
+        print(f"[LLM/Parse Error] {e}")
+        # Graceful fallback response structure
+        data = {
+            "spoken_text": f"Let us dive into {req.topic}! Observe the concept outline on our digital whiteboard.",
+            "whiteboard_type": "diagram",
+            "whiteboard_title": f"Overview: {req.topic}",
+            "whiteboard_content": "graph TD\n  A[Core Concept] --> B[Foundational Principles]\n  B --> C[Real-world Application]\n  C --> D[Mastery Checkpoint]",
+            "avatar_emotion": "explaining",
+            "avatar_gesture": "point_board",
+            "adaptive_question": f"What is the primary goal of studying {req.topic}?",
+            "question_options": ["Understanding key fundamentals", "Memorizing formulas", "Ignoring edge cases", "None of the above"],
+            "correct_option_index": 0,
+            "mastery_increment": 10
+        }
+
+    # Generate real-time TTS audio
+    spoken_text = data.get("spoken_text", "")
+    audio_data_url = synthesize_audio(spoken_text, req.language, req.persona)
+    data["audio_base64"] = audio_data_url
+
+    new_mastery = min(100, req.mastery_score + data.get("mastery_increment", 10))
+    data["current_mastery"] = new_mastery
+
+    return data
+
+@app.post("/api/tutor/evaluate")
+def evaluate_answer(req: AnswerRequest):
+    lang_name = LANGUAGE_CONFIG.get(req.language, "English")
+    persona_data = PERSONA_SPEAKERS.get(req.persona, PERSONA_SPEAKERS["simran"])
+
+    prompt = f"""You are {persona_data['name']}, an encouraging AI tutor.
+Language: {lang_name} ({req.language}).
+Topic: {req.topic}.
+Question asked to student: "{req.question}".
+Student's submitted answer: "{req.student_answer}".
+
+Evaluate the answer. Give warm, constructive feedback in 2 short sentences in {lang_name}.
+Output JSON strictly with:
+{{
+  "is_correct": true or false,
+  "spoken_feedback": "Constructive, warm spoken feedback in {lang_name}",
+  "detailed_explanation": "One clear sentence explaining the reasoning",
+  "avatar_emotion": "celebrating" or "encouraging",
+  "avatar_gesture": "nod" or "hands_open",
+  "mastery_bonus": 10 or 5
+}}
+"""
+
+    try:
+        llm_response = client.chat.completions(
+            model="sarvam-105b-conversations",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3
+        )
+        raw_text = llm_response.choices[0].message.content.strip()
+        if "```json" in raw_text:
+            raw_text = raw_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in raw_text:
+            raw_text = raw_text.split("```")[1].split("```")[0].strip()
+        result = json.loads(raw_text)
+    except Exception as e:
+        print(f"[Eval Error] {e}")
+        result = {
+            "is_correct": True,
+            "spoken_feedback": "Great effort! You are making wonderful progress on this concept.",
+            "detailed_explanation": "Consistent practice helps cement conceptual understanding.",
+            "avatar_emotion": "celebrating",
+            "avatar_gesture": "nod",
+            "mastery_bonus": 10
+        }
+
+    spoken = result.get("spoken_feedback", "")
+    audio_data_url = synthesize_audio(spoken, req.language, req.persona)
+    result["audio_base64"] = audio_data_url
+    result["new_mastery"] = min(100, req.current_mastery + result.get("mastery_bonus", 10))
+    return result
+
+@app.post("/api/tutor/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    language: str = Form("en-IN")
+):
+    """Transcribe student's voice input using Sarvam Saaras ASR"""
+    try:
+        content = await file.read()
+        filename = file.filename or "recording.webm"
+        
+        stt_res = client.speech_to_text.transcribe(
+            file=(filename, content),
+            model="saaras:v4",
+            language_code=language if language != "unknown" else "unknown"
+        )
+        transcript = getattr(stt_res, "transcript", "")
+        return {"transcript": transcript}
+    except Exception as e:
+        print(f"[STT Error] {e}")
+        return {"transcript": "", "error": str(e)}
+
+# Static files for the frontend
+static_dir = Path(__file__).parent / "static"
+static_dir.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+@app.get("/")
+def serve_index():
+    index_file = static_dir / "index.html"
+    if index_file.exists():
+        return FileResponse(str(index_file))
+    return {"message": "AI Avatar Tutor is running. Frontend static files loading..."}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=True)
